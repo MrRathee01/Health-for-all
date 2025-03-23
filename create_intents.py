@@ -1,19 +1,24 @@
 import os
 import pandas as pd
+from dotenv import load_dotenv
 from google.cloud import dialogflow_v2 as dialogflow
 
+# Load environment variables from .env file
+load_dotenv()
+
 # Set up Dialogflow client
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = r"C:\Users\vrath\OneDrive\Desktop\Project1google\nirogya-454420-de6f8f8df62b.json"  # Path to your service account JSON file
-project_id = "nirogya-454420"  # Replace with your Google Cloud project ID
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+project_id = os.getenv("PROJECT_ID")
 intents_client = dialogflow.IntentsClient()  # Use IntentsClient for creating intents
 sessions_client = dialogflow.SessionsClient()  # Use SessionsClient for user interactions
 parent = f"projects/{project_id}/agent"  # Parent path for Dialogflow agent
 
-# Load datasets
-symptom_to_disease = pd.read_csv(r"C:\Users\vrath\OneDrive\Desktop\Health-for-all\Dataset1\disease.csv")  # Disease and associated symptoms
-disease_description = pd.read_csv(r"C:\Users\vrath\OneDrive\Desktop\Health-for-all\Dataset1\symptom_Description.csv")  # Disease descriptions
-precautions = pd.read_csv(r"C:\Users\vrath\OneDrive\Desktop\Health-for-all\Dataset1\symptom_precaution.csv")  # Precautions for each disease
-symptom_severity = pd.read_csv(r"C:\Users\vrath\OneDrive\Desktop\Health-for-all\Dataset1\Symptom-severity.csv")  # Symptom severity (1-7)
+# Load datasets using relative paths
+base_dir = os.path.dirname(os.path.abspath(__file__))  # Get the directory of the script
+symptom_to_disease = pd.read_csv(os.path.join(base_dir, "Dataset1", "disease.csv"))  # Disease and associated symptoms
+disease_description = pd.read_csv(os.path.join(base_dir, "Dataset1", "symptom_Description.csv"))  # Disease descriptions
+precautions = pd.read_csv(os.path.join(base_dir, "Dataset1", "symptom_precaution.csv"))  # Precautions for each disease
+symptom_severity = pd.read_csv(os.path.join(base_dir, "Dataset1", "Symptom-severity.csv"))  # Symptom severity (1-7)
 
 # Group symptoms by disease
 grouped_symptoms = symptom_to_disease.groupby("Disease").agg(lambda x: x.dropna().tolist())
