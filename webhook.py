@@ -5,6 +5,7 @@ import os
 import pandas as pd
 from dotenv import load_dotenv
 import logging
+import re
 
 app = Flask(__name__)
 
@@ -25,242 +26,235 @@ dialogflow_client = dialogflow.SessionsClient()
 base_dir = os.path.dirname(os.path.abspath(__file__))
 DATASET_PATH = os.path.join(base_dir, "Dataset1")
 
-# Verify and load datasets
 try:
     symptom_to_disease = pd.read_csv(os.path.join(DATASET_PATH, "disease.csv"))
     disease_description = pd.read_csv(os.path.join(DATASET_PATH, "symptom_Description.csv"))
     precautions = pd.read_csv(os.path.join(DATASET_PATH, "symptom_precaution.csv"))
     symptom_severity = pd.read_csv(os.path.join(DATASET_PATH, "Symptom-severity.csv"))
-except FileNotFoundError as e:
+    
+    # Preprocess symptoms
+    symptom_severity['Symptom'] = symptom_severity['Symptom'].str.lower()
+    symptom_list = symptom_severity['Symptom'].tolist()
+    
+except Exception as e:
     logger.error(f"Dataset loading failed: {str(e)}")
     raise
 
 # Group symptoms by disease
 grouped_symptoms = symptom_to_disease.groupby("Disease").agg(lambda x: x.dropna().tolist())
 
-# Supported Indian languages
-SUPPORTED_LANGUAGES = {
-    'en': 'English',
-    'hi': 'Hindi',
-    'ta': 'Tamil',
-    'te': 'Telugu',
-    'kn': 'Kannada',
-    'ml': 'Malayalam',
-    'bn': 'Bengali',
-    'mr': 'Marathi',
-    'gu': 'Gujarati',
-    'pa': 'Punjabi'
+# Enhanced symptom variations mapping
+SYMPTOM_VARIATIONS = {
+    'fever': ['feverish', 'high temperature', 'hot', 'pyrexia', 'burning up'],
+    'headache': ['head pain', 'migraine', 'cephalalgia', 'head throbbing'],
+    'nausea': ['sick', 'queasy', 'nauseous', 'upset stomach'],
+    'fatigue': ['tiredness', 'exhaustion', 'lethargy', 'weariness'],
+    'dizziness': ['lightheaded', 'vertigo', 'unsteady', 'woozy'],
+    'cough': ['hacking cough', 'dry cough', 'tussis', 'coughing'],
+    'sore throat': ['throat pain', 'pharyngitis', 'scratchy throat'],
+    'chills': ['shivering', 'rigor', 'goosebumps', 'shuddering']
 }
 
-# Symptom synonyms mapping
-SYMPTOM_SYNONYMS = {
-    'fever': ['feverish', 'high temperature', 'hot'],
-    'headache': ['head pain', 'migraine'],
-    'nausea': ['sick', 'queasy'],
-    # Add more mappings
-}
+# Emergency keywords
+EMERGENCY_KEYWORDS = [
+    'emergency', 'urgent', 'critical', 'severe pain',
+    'can\'t breathe', 'chest pain', 'unconscious', 'bleeding heavily'
+]
 
 def detect_language(text):
-    """Detect language of input text"""
+    """Robust language detection"""
     try:
+        if not text or len(text.strip()) < 3:
+            return 'en'
         result = translate_client.detect_language(text)
-        return result['language']
+        return result['language'] if result['language'] in SUPPORTED_LANGUAGES else 'en'
     except Exception as e:
-        logger.error(f"Language detection failed: {str(e)}")
+        logger.warning(f"Language detection failed: {str(e)}")
         return 'en'
 
 def translate_text(text, target_language):
-    """Translate text to target language"""
+    """Safe translation with fallback"""
     try:
-        if target_language == 'en':
+        if not text or target_language == 'en':
             return text
-        result = translate_client.translate(text, target_language=target_language)
-        return result['translatedText']
+        return translate_client.translate(text, target_language=target_language)['translatedText']
     except Exception as e:
         logger.error(f"Translation failed: {str(e)}")
         return text
 
 def normalize_symptom(symptom_text, lang='en'):
-    """Normalize symptom text with translation support"""
+    """Advanced symptom normalization"""
+    if not symptom_text:
+        return None
+    
+    # Translate if needed
     if lang != 'en':
         symptom_text = translate_text(symptom_text, 'en')
     
-    symptom_text = symptom_text.lower().strip()
-    for symptom in symptom_severity["Symptom"]:
-        if symptom.lower() == symptom_text:
+    symptom_text = re.sub(r'[^\w\s]', '', symptom_text.lower().strip())
+    
+    # 1. Check exact matches
+    for symptom in symptom_list:
+        if symptom == symptom_text:
             return symptom
-    for canonical, synonyms in SYMPTOM_SYNONYMS.items():
-        if symptom_text in synonyms or symptom_text == canonical:
+    
+    # 2. Check variations
+    for canonical, variations in SYMPTOM_VARIATIONS.items():
+        if symptom_text in variations or symptom_text == canonical:
             return canonical
+    
+    # 3. Partial matching
+    for symptom in symptom_list:
+        if symptom in symptom_text or symptom_text in symptom:
+            return symptom
+    
     return None
 
 def extract_symptoms(text, lang='en'):
-    """Extract symptoms with multilingual support"""
+    """Comprehensive symptom extraction"""
+    if not text:
+        return []
+    
     if lang != 'en':
         text = translate_text(text, 'en')
     
-    symptoms = []
-    for symptom in symptom_severity["Symptom"]:
-        if symptom.lower() in text.lower():
-            symptoms.append(symptom)
+    text = text.lower()
+    symptoms_found = set()
     
-    found_synonyms = set()
-    for canonical, synonyms in SYMPTOM_SYNONYMS.items():
-        for synonym in synonyms:
-            if synonym in text.lower() and canonical not in found_synonyms:
-                symptoms.append(canonical)
-                found_synonyms.add(canonical)
+    # Check for multi-word symptoms first
+    for symptom in symptom_list:
+        if re.search(rf'\b{re.escape(symptom)}\b', text):
+            symptoms_found.add(symptom)
     
-    return list(set(symptoms))
+    # Check variations
+    for canonical, variations in SYMPTOM_VARIATIONS.items():
+        for variation in variations:
+            if re.search(rf'\b{re.escape(variation)}\b', text):
+                symptoms_found.add(canonical)
+    
+    return list(symptoms_found)
 
 def identify_diseases(symptoms):
-    """Identify possible diseases based on symptoms"""
-    possible_diseases = []
+    """Disease identification with scoring"""
+    disease_scores = {}
     for disease, row in grouped_symptoms.iterrows():
-        disease_symptoms = row[1:]  # Skip disease name column
-        if all(symptom in disease_symptoms for symptom in symptoms):
-            possible_diseases.append(disease)
-    return possible_diseases
+        disease_symptoms = [s.lower() for s in row[1:] if isinstance(s, str)]
+        match_count = sum(1 for symptom in symptoms if symptom.lower() in disease_symptoms)
+        if match_count > 0:
+            disease_scores[disease] = match_count / len(disease_symptoms)
+    return sorted(disease_scores.keys(), key=lambda x: disease_scores[x], reverse=True)
 
-def ask_next_symptom(possible_diseases, target_lang='en'):
-    """Get next symptoms to ask (with translation)"""
-    next_symptoms = set()
-    for disease in possible_diseases:
-        disease_symptoms = grouped_symptoms.loc[disease][1:]
-        next_symptoms.update(disease_symptoms)
+def check_emergency(symptoms, text):
+    """Comprehensive emergency detection"""
+    text_lower = text.lower()
     
-    symptoms_list = list(next_symptoms)
-    if target_lang != 'en':
-        symptoms_list = [translate_text(s, target_lang) for s in symptoms_list]
-    return symptoms_list
+    # Check emergency keywords
+    if any(keyword in text_lower for keyword in EMERGENCY_KEYWORDS):
+        return True
+    
+    # Check symptom severity
+    for symptom in symptoms:
+        severity = symptom_severity[symptom_severity["Symptom"] == symptom]["Severity"].values[0]
+        if severity >= 6:
+            return True
+    
+    return False
 
-def get_disease_info(disease, target_lang='en'):
-    """Get description and precautions (with translation)"""
+def get_disease_info(disease, lang='en'):
+    """Well-formatted disease information"""
     try:
         description = disease_description[disease_description["Disease"] == disease]["Description"].values[0]
-        precaution_columns = [col for col in precautions.columns if col.startswith("Precaution_")]
-        disease_precautions = precautions[precautions["Disease"] == disease][precaution_columns].values.flatten()
-        precaution_text = ", ".join([p for p in disease_precautions if pd.notna(p)])
+        precaution_cols = [col for col in precautions.columns if col.startswith("Precaution_")]
+        precautions_list = [p for p in precautions[precautions["Disease"] == disease][precaution_cols].values.flatten() if pd.notna(p)]
         
-        if target_lang != 'en':
-            description = translate_text(description, target_lang)
-            precaution_text = translate_text(precaution_text, target_lang)
+        # Format with bullet points
+        precaution_text = "\n• " + "\n• ".join(precautions_list)
+        
+        if lang != 'en':
+            description = translate_text(description, lang)
+            precaution_text = translate_text(precaution_text, lang)
         
         return description, precaution_text
     except Exception as e:
         logger.error(f"Error getting disease info: {str(e)}")
-        default_desc = translate_text("No description available", target_lang)
-        default_prec = translate_text("No precautions available", target_lang)
-        return default_desc, default_prec
-
-def check_emergency(symptoms):
-    """Check if symptoms indicate emergency"""
-    for symptom in symptoms:
-        severity = symptom_severity[symptom_severity["Symptom"] == symptom]["Severity"].values[0]
-        if severity == 7:
-            return True
-    return False
+        return None, None
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
         req = request.get_json(silent=True, force=True)
-        logger.info(f"Incoming request: {req}")
+        logger.info(f"Request received: {req}")
         
-        # Extract language from request or detect
+        # Extract basic information
         user_input = req.get("queryResult", {}).get("queryText", "")
         lang = req.get("queryResult", {}).get("languageCode", detect_language(user_input))
+        lang = lang if lang in SUPPORTED_LANGUAGES else 'en'
+        intent_name = req.get("queryResult", {}).get("intent", {}).get("displayName", "")
         
-        # Validate language
-        if lang not in SUPPORTED_LANGUAGES:
-            lang = 'en'
-        
-        # Process with Dialogflow
-        session_id = req["session"].split("/")[-1]
-        session_path = dialogflow_client.session_path(os.getenv("PROJECT_ID"), session_id)
-        
-        text_input = dialogflow.TextInput(text=user_input, language_code=lang)
-        query_input = dialogflow.QueryInput(text=text_input)
-        dialogflow_response = dialogflow_client.detect_intent(
-            session=session_path, 
-            query_input=query_input
-        )
-        
-        # Get parameters from Dialogflow
-        parameters = dialogflow_response.query_result.parameters
+        # Extract symptoms
+        parameters = req.get("queryResult", {}).get("parameters", {})
         symptoms = []
-        
-        # Extract symptoms from parameters
         for param, value in parameters.items():
             if "symptom" in param.lower():
                 if isinstance(value, list):
                     symptoms.extend([normalize_symptom(s, lang) for s in value if s])
                 elif isinstance(value, str):
                     symptoms.extend(extract_symptoms(value, lang))
-        
         symptoms = list(set([s for s in symptoms if s]))
         
-        # Main processing logic
-        intent_name = dialogflow_response.query_result.intent.display_name
+        # Main response logic
         response_text = ""
-        
-        if intent_name in ["General Symptoms", "Multiple Symptoms"]:
+        if intent_name in ["General Symptoms", "Multiple Symptoms", "Follow-up Symptoms"]:
             if not symptoms:
-                response_text = translate_text("Could you describe your symptoms in more detail?", lang)
+                response_text = translate_text("Please describe your symptoms in more detail.", lang)
             else:
+                is_emergency = check_emergency(symptoms, user_input)
                 possible_diseases = identify_diseases(symptoms)
-                if len(possible_diseases) > 1:
-                    next_symptoms = ask_next_symptom(possible_diseases, lang)
+                
+                if is_emergency:
                     response_text = translate_text(
-                        f"Do you also have any of these symptoms: {', '.join(next_symptoms)}?", 
+                        "🚨 EMERGENCY: Please seek immediate medical attention!", 
                         lang
                     )
-                elif len(possible_diseases) == 1:
+                elif possible_diseases:
                     disease = possible_diseases[0]
-                    description, precaution_text = get_disease_info(disease, lang)
-                    if check_emergency(symptoms):
-                        emergency_msg = translate_text(
-                            "EMERGENCY: Please seek immediate medical attention!", 
+                    description, precautions = get_disease_info(disease, lang)
+                    
+                    if description and precautions:
+                        response_text = (
+                            f"{translate_text('Possible diagnosis:', lang)} {disease}\n"
+                            f"{translate_text('Description:', lang)} {description}\n"
+                            f"{translate_text('Recommended actions:', lang)}{precautions}"
+                        )
+                    else:
+                        response_text = translate_text(
+                            "I couldn't retrieve complete information. Please consult a doctor.",
                             lang
                         )
-                        response_text = f"{emergency_msg} {translate_text('You might have', lang)} {disease}. {description}. {translate_text('Precautions:', lang)} {precaution_text}"
-                    else:
-                        response_text = f"{translate_text('You might have', lang)} {disease}. {description}. {translate_text('Precautions:', lang)} {precaution_text}"
                 else:
                     response_text = translate_text(
-                        "I couldn't identify any matching diseases. Please consult a doctor.", 
+                        "No matching conditions found. Please consult a healthcare professional.",
                         lang
                     )
-        
-        elif intent_name == "Follow-up Symptoms":
-            # Handle follow-up logic with context
-            pass  # Similar structure as above with context handling
-        
-        elif intent_name == "No More Symptoms":
-            # Handle no more symptoms case
-            pass  # Similar structure as above
-        
         else:
             response_text = translate_text(
-                "I didn't understand that. Could you describe your symptoms?", 
+                "Please describe your symptoms so I can help you better.",
                 lang
             )
         
-        # Prepare response
+        # Format response
         response = {
             "fulfillmentText": response_text,
             "payload": {
                 "google": {
                     "expectUserResponse": True,
                     "richResponse": {
-                        "items": [
-                            {
-                                "simpleResponse": {
-                                    "textToSpeech": response_text,
-                                    "displayText": response_text
-                                }
+                        "items": [{
+                            "simpleResponse": {
+                                "textToSpeech": response_text,
+                                "displayText": response_text
                             }
-                        ]
+                        }]
                     }
                 }
             }
@@ -269,9 +263,10 @@ def webhook():
         return jsonify(response)
     
     except Exception as e:
-        logger.error(f"Error in webhook: {str(e)}")
-        error_msg = translate_text("Sorry, I encountered an error. Please try again.", "en")
-        return jsonify({"fulfillmentText": error_msg})
+        logger.error(f"Webhook error: {str(e)}", exc_info=True)
+        return jsonify({
+            "fulfillmentText": "Sorry, I encountered an error. Please try again."
+        })
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=PORT, debug=True)
